@@ -1,88 +1,58 @@
-#
 # Copyright (c) 2021-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Module providing atomic state hydration mechanisms for concurrent evaluation pipelines."""
+"""
+Modulo de utilitarios para hidratacao e persistencia atomica de estado.
+Provê isolamento de exclusao mutua distribuida por ID de conversa.
+"""
 
 import asyncio
-from typing import Any, Dict, Optional
-
+from typing import Dict, Any, Callable
 
 class AtomicStateHydrator:
-    """Manages sharded, thread-safe asynchronous locks per conversation id.
-
-    Prevents state mutation race conditions under high throughput.
+    """
+    Gerenciador de ciclo de vida assincrono para protecao de condicoes de corrida.
+    Garante a linearizabilidade das operacoes de leitura e escrita de estado.
     """
 
-    def __init__(self, backend_client: Any) -> None:
-        """Initializes the hydrator component with an abstract storage backend.
-
-        Args:
-            backend_client: The high-level caching or database engine client.
+    def __init__(self, backend_client: Any):
         """
-        self.backend = backend_client
+        Inicializa o alicerce do hidratador atomico com o cliente de banco de dados.
+        """
+        self.backend_client = backend_client
         self._locks: Dict[str, asyncio.Lock] = {}
-        self._lock_creation_mutex: Optional[asyncio.Lock] = None
         self._ref_counts: Dict[str, int] = {}
 
-    def _ensure_mutex(self) -> asyncio.Lock:
-        """Lazily instantiates the underlying memory barrier inside the active event loop.
-
-        Returns:
-            asyncio.Lock: The active context lock instance.
-        """
-        if self._lock_creation_mutex is None:
-            self._lock_creation_mutex = asyncio.Lock()
-        return self._lock_creation_mutex
-
     async def _acquire_session_lock(self, conversation_id: str) -> asyncio.Lock:
-        """Tracks in-flight utilization and builds a local memory barrier for the session.
+        """
+        Acquire ou cria um sharded resource mutex exclusivo baseado no ID da conversa.
+        """
+        if conversation_id not in self._locks:
+            self._locks[conversation_id] = asyncio.Lock()
+            self._ref_counts[conversation_id] = 0
+        self._ref_counts[conversation_id] += 1
+        return self._locks[conversation_id]
+
+    async def execute_atomic_pipeline(self, conversation_id: str, evaluation_coro: Callable) -> tuple:
+        """
+        Executa uma corrotina de avaliacao garantindo isolamento linearizavel de estado.
 
         Args:
-            conversation_id: Unique string identifier for the active tracking sequence.
+            conversation_id (str): Identificador unico da sessao soberana.
+            evaluation_coro (Callable): Logica de IA a ser julgada sob exclusao mutua.
 
         Returns:
-            asyncio.Lock: The localized session block primitive.
+            tuple: Par ordenado contendo os eventos de sada e o estado atualizado.
         """
-        mutex = self._ensure_mutex()
-        async with mutex:
-            if conversation_id not in self._locks:
-                self._locks[conversation_id] = asyncio.Lock()
-                self._ref_counts[conversation_id] = 0
-            self._ref_counts[conversation_id] += 1
-            return self._locks[conversation_id]
-
-    # Correção: O método release deve ser um método real da classe
-    async def _release_session_lock(self, conversation_id: str) -> None:
-        mutex = self._ensure_mutex()
-        async with mutex:
-            if conversation_id in self._ref_counts:
-                self._ref_counts[conversation_id] -= 1
-                if self._ref_counts[conversation_id] <= 0:
-                    self._locks.pop(conversation_id, None)
-                    self._ref_counts.pop(conversation_id, None)
-
-    async def execute_atomic_pipeline(
-        self, conversation_id: str, evaluation_coro: Any, *args: Any, **kwargs: Any
-    ) -> Any:
         lock = await self._acquire_session_lock(conversation_id)
-        try:
-            async with lock:
-                current_state = await self.backend.fetch_state(conversation_id)
-                result, updated_state = await evaluation_coro(current_state, *args, **kwargs)
-                await self.backend.save_state(conversation_id, updated_state)
+        async with lock:
+            try:
+                state = await self.backend_client.fetch_state(conversation_id)
+                result, updated_state = await evaluation_coro(state)
+                await self.backend_client.save_state(conversation_id, updated_state)
                 return result, updated_state
-        finally:
-            # O finally garante a integridade do ref-count mesmo se a corotina falhar
-            await self._release_session_lock(conversation_id)
+            finally:
+                self._ref_counts[conversation_id] -= 1
+                if self._ref_counts[conversation_id] == 0:
+                    del self._locks[conversation_id]
+                    del self._ref_counts[conversation_id]
